@@ -623,7 +623,7 @@
                 wsClient.close();
                 consecutivePublishStall = 0;
             }
-        } else if (success) {
+        } else if (success) {1
             consecutivePublishStall = 0;
         }
 
