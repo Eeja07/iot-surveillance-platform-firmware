@@ -119,6 +119,9 @@
   uint32_t maxPublishMs = 0;
   uint32_t frameSize = 0;
   uint32_t maxFrameSize = 0;
+  uint32_t base64Size = 0;
+  uint32_t maxBase64Size = 0;
+  uint32_t mqttBufferSize = 0;
   uint32_t wifiDropCount = 0;
   uint32_t mqttReconnectCount = 0;
   bool firstMqttConnect = true;
@@ -159,7 +162,7 @@
   #else
     StaticJsonDocument<512> doc;
   #endif
-
+    doc["device_id"] = device_id;
     doc["uptime_sec"] = millis() / 1000;
     doc["free_heap"] = ESP.getFreeHeap();
     doc["min_free_heap"] = ESP.getMinFreeHeap();
@@ -195,6 +198,9 @@
     doc["publish_ms"] = publishMs;
     doc["max_publish_ms"] = maxPublishMs;
     doc["frame_size"] = frameSize;
+    doc["base64_size"] = base64Size;
+    doc["max_base64_size"] = maxBase64Size;
+    doc["mqtt_buffer"] = mqttBufferSize;
     doc["max_frame_size"] = maxFrameSize;
 
     doc["publish_ok"] = publishOkCount;
@@ -266,22 +272,16 @@
     config.pixel_format = PIXFORMAT_JPEG;
 
     config.frame_size = FRAMESIZE_SVGA;  
-    config.jpeg_quality = 15;            
+    config.jpeg_quality = 20;            
     config.fb_count = 2;
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) { ESP.restart(); }
-    
-    Serial.println("Kamera diinisialisasi pada resolusi SVGA (Medium)");
   }
   void resetCameraOnly()
   {
       cameraResetCount++;
       lastRecoveryReason = "BUTTON";
-
-      Serial.println(
-        "[BUTTON] CAMERA RESET"
-      );
 
       esp_camera_deinit();
 
@@ -308,17 +308,11 @@
 
           if (held >= 10000)
           {
-              Serial.println(
-                  "[BUTTON] ESP RESTART"
-              );
               buttonPressStart = 0;
               ESP.restart();
           }
           else if (held >= 5000)
           {
-              Serial.println(
-                  "[BUTTON] WIFI RESET"
-              );
 
               WiFiManager wm;
               wm.resetSettings();
@@ -472,10 +466,7 @@
             ESP.restart();
         }
     }
-    Serial.printf(
-        "MQTT BUFFER=%u\n",
-        mqttClient.getBufferSize()
-    );
+    mqttBufferSize = mqttClient.getBufferSize();
     wsClient.setInsecure();
 
     wsClient.addHeader(
@@ -578,6 +569,12 @@
 
     size_t dataSize =
         base64Data.length();
+    base64Size = dataSize;
+
+    if (base64Size > maxBase64Size)
+    {
+        maxBase64Size = base64Size;
+    }
     bool success = false;
 
     size_t mqttLimit =
@@ -623,7 +620,7 @@
                 wsClient.close();
                 consecutivePublishStall = 0;
             }
-        } else if (success) {1
+        } else if (success) {
             consecutivePublishStall = 0;
         }
 
