@@ -17,7 +17,7 @@
   #include <esp_ota_ops.h>
   #define LED_PIN 4
   #define DEVICE_HOSTNAME "cctv-medium-local"
-  #define FW_VERSION "1.0.0"
+  #define FW_VERSION "1.0.1"
   #define FW_BOARD   "ESP32-CAM"
   #define FW_MODEL   "AI_THINKER"
   #define FW_BUILD   __DATE__ " " __TIME__
@@ -36,6 +36,15 @@
   const String topic_status     = "ws/camera/" + String(device_id) + "/status";
   const String topic_ota        = "ws/camera/" + String(device_id) + "/ota";
   const String topic_ota_status = "ws/camera/" + String(device_id) + "/ota/status";
+  const String topic_config        = "ws/camera/" + String(device_id) + "/config";
+  const String topic_config_status = "ws/camera/" + String(device_id) + "/config/status";
+
+  // Remote Device Configuration variables
+  bool image_enabled = true;
+  bool telemetry_enabled = true;
+  bool ota_enabled = true;
+  framesize_t current_frame_size = FRAMESIZE_SVGA;
+  int current_jpeg_quality = 25;
 
   #define PWDN_GPIO_NUM     32
   #define RESET_GPIO_NUM    -1
@@ -135,10 +144,10 @@
   PubSubClient mqttClient(wsWrapper);
 
   unsigned long last_capture_time = 0;
-  const unsigned long capture_interval = 3000; 
+  unsigned long capture_interval_ms = 3000; 
 
   unsigned long last_telemetry_time = 0;
-  const unsigned long telemetry_interval = 60000;
+  unsigned long telemetry_interval_ms = 60000;
   String lastRecoveryReason = "NONE";
   uint32_t captureOkCount = 0;
   uint32_t captureFailCount = 0;
@@ -759,6 +768,272 @@
       ESP.restart();
   }
 
+  framesize_t stringToFrameSize(const String& fs) {
+      if (fs == "QQVGA") return FRAMESIZE_QQVGA;
+      if (fs == "QCIF") return FRAMESIZE_QCIF;
+      if (fs == "HQVGA") return FRAMESIZE_HQVGA;
+      if (fs == "240X240") return FRAMESIZE_240X240;
+      if (fs == "QVGA") return FRAMESIZE_QVGA;
+      if (fs == "CIF") return FRAMESIZE_CIF;
+      if (fs == "HVGA") return FRAMESIZE_HVGA;
+      if (fs == "VGA") return FRAMESIZE_VGA;
+      if (fs == "SVGA") return FRAMESIZE_SVGA;
+      if (fs == "XGA") return FRAMESIZE_XGA;
+      if (fs == "HD") return FRAMESIZE_HD;
+      if (fs == "SXGA") return FRAMESIZE_SXGA;
+      if (fs == "UXGA") return FRAMESIZE_UXGA;
+      return (framesize_t)-1;
+  }
+
+  String frameSizeToString(framesize_t fs) {
+      switch (fs) {
+          case FRAMESIZE_QQVGA: return "QQVGA";
+          case FRAMESIZE_QCIF: return "QCIF";
+          case FRAMESIZE_HQVGA: return "HQVGA";
+          case FRAMESIZE_240X240: return "240X240";
+          case FRAMESIZE_QVGA: return "QVGA";
+          case FRAMESIZE_CIF: return "CIF";
+          case FRAMESIZE_HVGA: return "HVGA";
+          case FRAMESIZE_VGA: return "VGA";
+          case FRAMESIZE_SVGA: return "SVGA";
+          case FRAMESIZE_XGA: return "XGA";
+          case FRAMESIZE_HD: return "HD";
+          case FRAMESIZE_SXGA: return "SXGA";
+          case FRAMESIZE_UXGA: return "UXGA";
+          default: return "UNKNOWN";
+      }
+  }
+
+  bool initCamera(bool rebootOnFail = true);
+
+  void publishConfigStatus(const char* status, const char* messageOrReason, bool success) {
+      #if ARDUINOJSON_VERSION_MAJOR >= 7
+        JsonDocument doc;
+      #else
+        StaticJsonDocument<512> doc;
+      #endif
+      
+      doc["status"] = status;
+      if (success) {
+          doc["message"] = messageOrReason;
+          doc["applied"]["jpeg_quality"] = current_jpeg_quality;
+          doc["applied"]["frame_size"] = frameSizeToString(current_frame_size);
+          doc["applied"]["capture_interval_ms"] = capture_interval_ms;
+          doc["applied"]["telemetry_interval_ms"] = telemetry_interval_ms;
+          doc["applied"]["image_enabled"] = image_enabled;
+          doc["applied"]["telemetry_enabled"] = telemetry_enabled;
+          doc["applied"]["ota_enabled"] = ota_enabled;
+          doc["applied"]["mqtt_buffer"] = mqttBufferSize;
+      } else {
+          doc["reason"] = messageOrReason;
+      }
+      
+      String payload;
+      serializeJson(doc, payload);
+      bool ok = mqttClient.publish(topic_config_status.c_str(), payload.c_str(), true);
+
+      Serial.printf(
+          "[CONFIG STATUS] topic=%s publish=%s state=%d connected=%d\n",
+          topic_config_status.c_str(),
+          ok ? "OK" : "FAIL",
+          mqttClient.state(),
+          mqttClient.connected()
+      );
+  }
+
+  void handleConfigPayload(byte* payload, unsigned int length) {
+      Serial.println("[CONFIG] REQUEST RECEIVED");
+      #if ARDUINOJSON_VERSION_MAJOR >= 7
+        JsonDocument doc;
+      #else
+        DynamicJsonDocument doc(1024);
+      #endif
+      
+      DeserializationError error = deserializeJson(doc, (const char*)payload, length);
+      if (error) {
+          Serial.printf("[CONFIG] Parse error: %s\n", error.c_str());
+          publishConfigStatus("CONFIG_FAILED", "Malformed JSON", false);
+          return;
+      }
+      
+      Serial.println("[CONFIG] JSON OK");
+
+      JsonVariant cfg = doc;
+      if (doc.containsKey("config")) {
+          cfg = doc["config"];
+      }
+
+      // Validate parameters
+      int new_jpeg_quality = current_jpeg_quality;
+      if (cfg.containsKey("jpeg_quality")) {
+          if (!cfg["jpeg_quality"].is<int>()) {
+              publishConfigStatus("CONFIG_FAILED", "jpeg_quality must be an integer", false);
+              return;
+          }
+          int val = cfg["jpeg_quality"].as<int>();
+          if (val < 10 || val > 63) {
+              publishConfigStatus("CONFIG_FAILED", "jpeg_quality must be between 10 and 63", false);
+              return;
+          }
+          new_jpeg_quality = val;
+      }
+
+      framesize_t new_frame_size = current_frame_size;
+      String new_frame_size_str = frameSizeToString(current_frame_size);
+      if (cfg.containsKey("frame_size")) {
+          if (!cfg["frame_size"].is<const char*>()) {
+              publishConfigStatus("CONFIG_FAILED", "frame_size must be a string", false);
+              return;
+          }
+          String val = cfg["frame_size"].as<String>();
+          framesize_t fs = stringToFrameSize(val);
+          if (fs == (framesize_t)-1) {
+              publishConfigStatus("CONFIG_FAILED", "Invalid frame_size", false);
+              return;
+          }
+          new_frame_size = fs;
+          new_frame_size_str = val;
+      }
+
+      unsigned long new_capture_interval_ms = capture_interval_ms;
+      if (cfg.containsKey("capture_interval_ms")) {
+          if (!cfg["capture_interval_ms"].is<unsigned long>() && !cfg["capture_interval_ms"].is<int>()) {
+              publishConfigStatus("CONFIG_FAILED", "capture_interval_ms must be an integer", false);
+              return;
+          }
+          long val = cfg["capture_interval_ms"].as<long>();
+          if (val < 500) {
+              publishConfigStatus("CONFIG_FAILED", "capture_interval_ms must be at least 500", false);
+              return;
+          }
+          new_capture_interval_ms = (unsigned long)val;
+      }
+
+      unsigned long new_telemetry_interval_ms = telemetry_interval_ms;
+      if (cfg.containsKey("telemetry_interval_ms")) {
+          if (!cfg["telemetry_interval_ms"].is<unsigned long>() && !cfg["telemetry_interval_ms"].is<int>()) {
+              publishConfigStatus("CONFIG_FAILED", "telemetry_interval_ms must be an integer", false);
+              return;
+          }
+          long val = cfg["telemetry_interval_ms"].as<long>();
+          if (val < 1000) {
+              publishConfigStatus("CONFIG_FAILED", "telemetry_interval_ms must be at least 1000", false);
+              return;
+          }
+          new_telemetry_interval_ms = (unsigned long)val;
+      }
+
+      bool new_image_enabled = image_enabled;
+      if (cfg.containsKey("image_enabled")) {
+          if (!cfg["image_enabled"].is<bool>()) {
+              publishConfigStatus("CONFIG_FAILED", "image_enabled must be a boolean", false);
+              return;
+          }
+          new_image_enabled = cfg["image_enabled"].as<bool>();
+      }
+
+      bool new_telemetry_enabled = telemetry_enabled;
+      if (cfg.containsKey("telemetry_enabled")) {
+          if (!cfg["telemetry_enabled"].is<bool>()) {
+              publishConfigStatus("CONFIG_FAILED", "telemetry_enabled must be a boolean", false);
+              return;
+          }
+          new_telemetry_enabled = cfg["telemetry_enabled"].as<bool>();
+      }
+
+      bool new_ota_enabled = ota_enabled;
+      if (cfg.containsKey("ota_enabled")) {
+          if (!cfg["ota_enabled"].is<bool>()) {
+              publishConfigStatus("CONFIG_FAILED", "ota_enabled must be a boolean", false);
+              return;
+          }
+          new_ota_enabled = cfg["ota_enabled"].as<bool>();
+      }
+
+      int new_mqtt_buffer = mqttBufferSize;
+      if (cfg.containsKey("mqtt_buffer")) {
+          if (!cfg["mqtt_buffer"].is<int>()) {
+              publishConfigStatus("CONFIG_FAILED", "mqtt_buffer must be an integer", false);
+              return;
+          }
+          int val = cfg["mqtt_buffer"].as<int>();
+          if (val < 1024 || val > 131072) {
+              publishConfigStatus("CONFIG_FAILED", "mqtt_buffer must be between 1024 and 131072", false);
+              return;
+          }
+          new_mqtt_buffer = val;
+      }
+
+      // Log the apply actions
+      if (cfg.containsKey("frame_size")) {
+          Serial.printf("[CONFIG] APPLY frame_size=%s\n", new_frame_size_str.c_str());
+      }
+      if (cfg.containsKey("jpeg_quality")) {
+          Serial.printf("[CONFIG] APPLY jpeg_quality=%d\n", new_jpeg_quality);
+      }
+      if (cfg.containsKey("capture_interval_ms")) {
+          Serial.printf("[CONFIG] APPLY capture_interval_ms=%lu\n", new_capture_interval_ms);
+      }
+      if (cfg.containsKey("telemetry_interval_ms")) {
+          Serial.printf("[CONFIG] APPLY telemetry_interval_ms=%lu\n", new_telemetry_interval_ms);
+      }
+      if (cfg.containsKey("image_enabled")) {
+          Serial.printf("[CONFIG] APPLY image_enabled=%s\n", new_image_enabled ? "true" : "false");
+      }
+      if (cfg.containsKey("telemetry_enabled")) {
+          Serial.printf("[CONFIG] APPLY telemetry_enabled=%s\n", new_telemetry_enabled ? "true" : "false");
+      }
+      if (cfg.containsKey("ota_enabled")) {
+          Serial.printf("[CONFIG] APPLY ota_enabled=%s\n", new_ota_enabled ? "true" : "false");
+      }
+      if (cfg.containsKey("mqtt_buffer")) {
+          Serial.printf("[CONFIG] APPLY mqtt_buffer=%d\n", new_mqtt_buffer);
+      }
+
+      // Apply camera configuration (safe camera re-init if changed)
+      bool cameraChanged = (new_frame_size != current_frame_size || new_jpeg_quality != current_jpeg_quality);
+      if (cameraChanged) {
+          framesize_t old_frame_size = current_frame_size;
+          int old_jpeg_quality = current_jpeg_quality;
+          
+          current_frame_size = new_frame_size;
+          current_jpeg_quality = new_jpeg_quality;
+          
+          esp_camera_deinit();
+          delay(1000);
+          if (!initCamera(false)) {
+              // Rollback
+              current_frame_size = old_frame_size;
+              current_jpeg_quality = old_jpeg_quality;
+              esp_camera_deinit();
+              delay(1000);
+              initCamera(false);
+              publishConfigStatus("CONFIG_FAILED", "Camera re-init failed", false);
+              return;
+          }
+      }
+
+      // Apply MQTT buffer configuration
+      bool mqttBufferChanged = (new_mqtt_buffer != mqttBufferSize);
+      if (mqttBufferChanged) {
+          if (!mqttClient.setBufferSize(new_mqtt_buffer)) {
+              publishConfigStatus("CONFIG_FAILED", "Failed to set MQTT buffer size", false);
+              return;
+          }
+          mqttBufferSize = mqttClient.getBufferSize();
+      }
+
+      // Apply other parameters
+      capture_interval_ms = new_capture_interval_ms;
+      telemetry_interval_ms = new_telemetry_interval_ms;
+      image_enabled = new_image_enabled;
+      telemetry_enabled = new_telemetry_enabled;
+      ota_enabled = new_ota_enabled;
+
+      Serial.println("[CONFIG] SUCCESS");
+      publishConfigStatus("CONFIG_SUCCESS", "Applied", true);
+  }
+
   void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
       if (String(topic) == topic_ota) {
@@ -782,6 +1057,10 @@
 
           if (action == "ota") {
               Serial.println("[OTA] OTA REQUEST RECEIVED");
+              if (!ota_enabled) {
+                  publishOtaStatus("OTA_FAILED", -1, "OTA disabled");
+                  return;
+              }
               if (!doc.containsKey("manifest")) {
                   publishOtaStatus("OTA_FAILED", -1, "URL missing");
                   return;
@@ -825,6 +1104,8 @@
               mqttClient.connected()
               );
           }
+      } else if (String(topic) == topic_config) {
+          handleConfigPayload(payload, length);
       }
   }
 
@@ -841,6 +1122,7 @@
   }
 
   void sendTelemetry() {
+    if (!telemetry_enabled) return;
     if (otaRunning) return;
 
   #if ARDUINOJSON_VERSION_MAJOR >= 7
@@ -949,7 +1231,7 @@
     }
   }
 
-  void initCamera() {
+  bool initCamera(bool rebootOnFail) {
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer   = LEDC_TIMER_0;
@@ -972,12 +1254,18 @@
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
 
-    config.frame_size = FRAMESIZE_SVGA;  
-    config.jpeg_quality = 25;            
+    config.frame_size = current_frame_size;  
+    config.jpeg_quality = current_jpeg_quality;            
     config.fb_count = 2;
 
     esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) { ESP.restart(); }
+    if (err != ESP_OK) { 
+        if (rebootOnFail) {
+            ESP.restart(); 
+        }
+        return false;
+    }
+    return true;
   }
   void resetCameraOnly()
   {
@@ -1107,6 +1395,7 @@
             true
           );
           bool subOk = mqttClient.subscribe(topic_ota.c_str());
+          bool subConfigOk = mqttClient.subscribe(topic_config.c_str());
           sendTelemetry();
 
           return;
@@ -1213,12 +1502,12 @@
         }
     }
 
-    if (!otaRunning && (millis() - last_capture_time > capture_interval)) {
+    if (!otaRunning && image_enabled && (millis() - last_capture_time > capture_interval_ms)) {
       last_capture_time = millis();
       sendPhoto();
     }
 
-    if (!otaRunning && (millis() - last_telemetry_time >= telemetry_interval)) {
+    if (!otaRunning && telemetry_enabled && (millis() - last_telemetry_time >= telemetry_interval_ms)) {
       last_telemetry_time = millis();
       sendTelemetry();
     }
@@ -1259,6 +1548,7 @@
   }
 
   void sendPhoto() {
+    if (!image_enabled) return;
     unsigned long captureStart = millis();
     camera_fb_t *fb = esp_camera_fb_get();
 
@@ -1321,7 +1611,7 @@
             maxPublishMs = publishMs;
         }
 
-        if (publishMs > capture_interval) {
+        if (publishMs > capture_interval_ms) {
             publishOverIntervalCount++;
         }
 
