@@ -16,10 +16,11 @@
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
+#include <freertos/event_groups.h>
 
 struct PublishRequest {
-    const char* topic;
-    const char* payload;
+    char topic[96];
+    char payload[3072];
     bool retained;
 };
 
@@ -158,6 +159,14 @@ unsigned long capture_interval_ms = 3000;
 unsigned long last_telemetry_time = 0;
 unsigned long telemetry_interval_ms = 60000;
 String lastRecoveryReason = "NONE";
+volatile uint32_t publisherProgressMillis = 0;
+volatile bool publisherStarted = false;
+volatile bool remoteRestartRequested = false;
+volatile bool remoteCameraReinitRequested = false;
+// Edit 2 & 3: Event group for safe multi-core OTA synchronization
+EventGroupHandle_t otaSyncEventGroup = nullptr;
+#define CAMERA_CAPTURE_IDLE_BIT (1 << 0)
+#define PUBLISHER_IDLE_BIT      (1 << 1)
 uint32_t captureOkCount = 0;
 uint32_t captureFailCount = 0;
 uint32_t fbNullCount = 0;
@@ -203,7 +212,6 @@ uint32_t camera_init_ms = 0;
 unsigned long last_failure_free_time = 0;
 unsigned long recovery_start_time = 0;
 unsigned long last_publish_fail_time = 0;
-uint32_t recovery_level = 0;
 const char* recovery_state = "NORMAL";
 uint32_t connect_dns_ms = 0;
 uint32_t connect_ws_ms = 0;
@@ -228,17 +236,106 @@ int otaLastProgress = 0;
 unsigned long otaLastHeartbeatTime = 0;
 unsigned long otaLastDataMillis = 0;
 
-unsigned long lastImageSuccessMillis = 0;
+uint32_t lastCaptureSuccessMillis = 0;
 const uint32_t DEADMAN_TIMEOUT_MS = 300000UL; // 5 menit
+const uint32_t TRANSPORT_WATCHDOG_TIMEOUT_MS = 180000UL; // 3 menit
 const uint32_t MAX_TRANSPORT_RECOVERY = 10;
-const uint32_t HW_WDT_SEC = 30;
-uint32_t consecutivePublishFail = 0;
-uint32_t consecutiveSlowPublishes = 0;
+
+// Transport health watchdog and diagnostics
+const char* const STATE_CONNECTED = "CONNECTED";
+const char* const STATE_DISCONNECTED = "DISCONNECTED";
+const char* const STATE_CONNECT_FAILED = "CONNECT_FAILED";
+const char* const STATE_RECOVERING = "RECOVERING";
+
+volatile uint32_t lastPublishSuccessMillis = 0;
+uint32_t publishQueueOverflowCount = 0;
+uint32_t publishQueueDropCount = 0;
+uint32_t publishQueuePeak = 0;
+volatile uint32_t lastWatchdogRecoveryMillis = 0;
+const char* volatile transport_state = STATE_DISCONNECTED;
+volatile uint32_t consecutive_transport_recovery = 0;
+volatile bool last_publish_result = false;
+volatile bool last_connect_result = false;
+volatile int lastFailedPublishMqttState = 0;
+volatile wl_status_t lastFailedPublishWifiStatus = WL_IDLE_STATUS;
+volatile uint32_t watchdog_trigger_count = 0;
+const char* volatile watchdog_last_reason = "NONE";
+volatile uint32_t last_watchdog_trigger_ms = 0;
+volatile uint32_t last_transport_recovery_ms = 0;
+volatile int transport_recovery_level = 0;
+
+enum OTAState {
+    OTA_IDLE,
+    OTA_DOWNLOAD_MANIFEST,
+    OTA_VALIDATE,
+    OTA_DOWNLOAD_FIRMWARE,
+    OTA_VERIFY,
+    OTA_FLASH,
+    OTA_SUCCESS,
+    OTA_FAILED,
+    OTA_CANCELLED
+};
+
+enum RecoveryLevel {
+    REC_NONE = 0,
+    REC_MQTT_RECONNECT = 1,
+    REC_TRANSPORT_RECONNECT = 2,
+    REC_WIFI_RECONNECT = 3,
+    REC_WIFI_BEGIN = 4,
+    REC_REBOOT = 5
+};
+
+enum class RecoveryReason {
+    NONE = 0,
+    WATCHDOG_TIMEOUT = 1,
+    CONSECUTIVE_FAILURES = 2,
+    MQTT_CONNECTING = 3,
+    WIFI_OFFLINE_300S = 4,
+    WIFI_OFFLINE_600S = 5,
+    CONSECUTIVE_TRANSPORT_FAILURES = 6,
+    DEADMAN_TIMEOUT = 7,
+    PUBLISHER_STUCK = 8
+};
+
 enum TransportHealth {
     NORMAL,
     WARNING,
     RECOVERY_REQUIRED
 };
+
+inline const char* getRecoveryReasonStr(RecoveryReason reason) {
+    switch (reason) {
+        case RecoveryReason::NONE: return "NONE";
+        case RecoveryReason::WATCHDOG_TIMEOUT: return "TIMEOUT";
+        case RecoveryReason::CONSECUTIVE_FAILURES: return "CONSECUTIVE_FAILURES";
+        case RecoveryReason::MQTT_CONNECTING: return "MQTT_CONNECTING";
+        case RecoveryReason::WIFI_OFFLINE_300S: return "WIFI_OFFLINE_300S";
+        case RecoveryReason::WIFI_OFFLINE_600S: return "WIFI_OFFLINE_600S";
+        case RecoveryReason::CONSECUTIVE_TRANSPORT_FAILURES: return "CONSECUTIVE_TRANSPORT_FAILURES";
+        case RecoveryReason::DEADMAN_TIMEOUT: return "DEADMAN_TIMEOUT";
+        case RecoveryReason::PUBLISHER_STUCK: return "PUBLISHER_STUCK";
+        default: return "UNKNOWN";
+    }
+}
+
+void updateTransportState(const char* state, RecoveryLevel level, RecoveryReason reason) {
+    transport_state = state;
+    transport_recovery_level = (int)level;
+    if (level != REC_NONE) {
+        last_transport_recovery_ms = millis();
+        if (reason == RecoveryReason::WATCHDOG_TIMEOUT || reason == RecoveryReason::CONSECUTIVE_FAILURES) {
+            watchdog_trigger_count++;
+            watchdog_last_reason = getRecoveryReasonStr(reason);
+            last_watchdog_trigger_ms = millis();
+        }
+    } else {
+        consecutive_transport_recovery = 0;
+    }
+}
+
+const uint32_t HW_WDT_SEC = 30;
+uint32_t consecutivePublishFail = 0;
+uint32_t consecutiveSlowPublishes = 0;
 
 enum class PendingFrameState : uint8_t {
     EMPTY = 0,
@@ -273,17 +370,7 @@ unsigned long lastPublishAttemptMillis = 0;
 uint32_t publishOverIntervalCount = 0;
 uint32_t telemetryPublishFailCount = 0;
 
-enum OTAState {
-    OTA_IDLE,
-    OTA_DOWNLOAD_MANIFEST,
-    OTA_VALIDATE,
-    OTA_DOWNLOAD_FIRMWARE,
-    OTA_VERIFY,
-    OTA_FLASH,
-    OTA_SUCCESS,
-    OTA_FAILED,
-    OTA_CANCELLED
-};
+
 
 OTAState currentOtaState = OTA_IDLE;
 bool otaRunning = false;
@@ -311,6 +398,7 @@ unsigned long otaDownloadEndTime = 0;
 unsigned long otaFlashStartTime = 0;
 unsigned long otaFlashEndTime = 0;
 
+
 const char* otaStateToString(OTAState state) {
     switch (state) {
         case OTA_IDLE: return "IDLE";
@@ -331,7 +419,7 @@ const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxy
 // ==========================================
 // THREAD-SAFE PUBLISH DISPATCHER
 // ==========================================
-#define MAX_PUBLISH_REQUESTS 16
+#define MAX_PUBLISH_REQUESTS 8
 static PublishRequest publishQueue[MAX_PUBLISH_REQUESTS];
 static volatile int publishQueueHead = 0;
 static volatile int publishQueueTail = 0;
@@ -351,15 +439,55 @@ static portMUX_TYPE configPublishMux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE telemetryPublishMux = portMUX_INITIALIZER_UNLOCKED;
 
 bool enqueuePublish(const char* topic, const char* payload, bool retained) {
+    if (!topic || !payload) return false;
     bool success = false;
     portENTER_CRITICAL(&publishQueueMux);
     int nextTail = (publishQueueTail + 1) % MAX_PUBLISH_REQUESTS;
+
+    // Priority Admission Policy
+    if (nextTail == publishQueueHead) {
+        bool isTelemetry = (strstr(topic, "/telemetry") != nullptr);
+        if (!isTelemetry) {
+            int current = publishQueueHead;
+            int foundIdx = -1;
+            while (current != publishQueueTail) {
+                if (strstr(publishQueue[current].topic, "/telemetry") != nullptr) {
+                    foundIdx = current;
+                    break;
+                }
+                current = (current + 1) % MAX_PUBLISH_REQUESTS;
+            }
+            if (foundIdx != -1) {
+                int currIdx = foundIdx;
+                while (currIdx != publishQueueHead) {
+                    int prevIdx = (currIdx - 1 + MAX_PUBLISH_REQUESTS) % MAX_PUBLISH_REQUESTS;
+                    publishQueue[currIdx] = publishQueue[prevIdx];
+                    currIdx = prevIdx;
+                }
+                publishQueueHead = (publishQueueHead + 1) % MAX_PUBLISH_REQUESTS;
+                publishQueueDropCount++;
+                nextTail = (publishQueueTail + 1) % MAX_PUBLISH_REQUESTS;
+            }
+        }
+    }
+
     if (nextTail != publishQueueHead) {
-        publishQueue[publishQueueTail].topic = topic;
-        publishQueue[publishQueueTail].payload = payload;
+        strncpy(publishQueue[publishQueueTail].topic, topic, sizeof(publishQueue[publishQueueTail].topic) - 1);
+        publishQueue[publishQueueTail].topic[sizeof(publishQueue[publishQueueTail].topic) - 1] = '\0';
+
+        strncpy(publishQueue[publishQueueTail].payload, payload, sizeof(publishQueue[publishQueueTail].payload) - 1);
+        publishQueue[publishQueueTail].payload[sizeof(publishQueue[publishQueueTail].payload) - 1] = '\0';
+
         publishQueue[publishQueueTail].retained = retained;
         publishQueueTail = nextTail;
         success = true;
+
+        int depth = (publishQueueTail - publishQueueHead + MAX_PUBLISH_REQUESTS) % MAX_PUBLISH_REQUESTS;
+        if (depth > (int)publishQueuePeak) {
+            publishQueuePeak = depth;
+        }
+    } else {
+        publishQueueOverflowCount++;
     }
     portEXIT_CRITICAL(&publishQueueMux);
     if (success && publisherTaskHandle != NULL) {
@@ -436,13 +564,14 @@ bool canPerformReboot() {
 bool initCamera(bool rebootOnFail = true);
 
 void handleSoftRecovery(const char* reason) {
+    if (otaRunning) return; // Edit 1: Suspend soft recovery during OTA
+    lastRecoveryReason = String(reason);
     consecutive_failures++;
     last_failure_free_time = millis();
     if (consecutive_failures == 1) {
         recovery_start_time = millis();
     }
     
-    recovery_level = consecutive_failures;
     if (suspend_capture_until > millis()) {
         recovery_state = "SUSPENDED";
     } else if (consecutive_failures > 0) {
@@ -554,6 +683,9 @@ bool isVersionGreater(const String& newVer, const String& currVer) {
 }
 
 void resetOtaState() {
+    // Edit 5: Clean up all OTA HTTP/TLS and hash resources
+    otaHttp.end();
+    otaClient.stop();
     if (otaHasher) {
         delete otaHasher;
         otaHasher = nullptr;
@@ -701,7 +833,7 @@ void tickOtaStateMachine() {
             }
 
             otaClient.setInsecure();
-            otaHttp.setTimeout(30000);
+            otaHttp.setTimeout(30000); // Reverted to 30s
             otaHttp.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
             if (otaHttp.begin(otaClient, otaRequestManifestUrl)) {
@@ -828,8 +960,8 @@ void tickOtaStateMachine() {
             bool is_connected = stream->connected();
             size_t available = stream->available();
 
-            if (millis() - otaFlashStartTime > 180000) {
-                otaFailReason = "Flash timeout (180s)";
+            if (millis() - otaFlashStartTime > 300000) {
+                otaFailReason = "Flash timeout (300s)";
                 Update.abort();
                 otaHttp.end();
                 transitionOtaState(OTA_FAILED);
@@ -844,8 +976,72 @@ void tickOtaStateMachine() {
                 return;
             }
 
-            if (millis() - otaLastDataMillis > 30000) {
-                otaFailReason = "Download stalled (no data for 30s)";
+            // Edit 4: Flat 45s download stall check (no connected bonus)
+            if (millis() - otaLastDataMillis > 45000) {
+                otaFailReason = "Download stalled (no data for 45s)";
+                Update.abort();
+                otaHttp.end();
+                transitionOtaState(OTA_FAILED);
+                return;
+            }
+
+            // Edit 2: Change vTaskDelay from 1 to 5 when no data is available
+            if (available == 0) {
+                yield();
+                vTaskDelay(pdMS_TO_TICKS(5));
+                return;
+            }
+
+            // Draining Loop: drain up to OTA_MAX_BYTES_PER_TICK of TLS buffer in one tick
+            constexpr size_t OTA_CHUNK_SIZE = 2048;
+            constexpr size_t OTA_MAX_BYTES_PER_TICK = 8192;
+            
+            bool writeError = false;
+            size_t bytesProcessed = 0;
+            
+            while (available > 0 && otaWritten < otaSize && bytesProcessed < OTA_MAX_BYTES_PER_TICK) {
+                static uint8_t buff[OTA_CHUNK_SIZE];
+                // Edit: Safe remaining check to prevent reading beyond expected otaSize
+                size_t remaining = (otaSize > otaWritten) ? (otaSize - otaWritten) : 0;
+                size_t toRead = std::min((size_t)available, sizeof(buff));
+                toRead = std::min(toRead, remaining);
+                
+                int readBytes = stream->readBytes((char*)buff, toRead);
+                
+                // Edit 3: Explicitly handle readBytes <= 0
+                if (readBytes <= 0) {
+                    break;
+                }
+                
+                otaLastDataMillis = millis();
+                
+                if (otaSha256.length() > 0 && otaHasher) {
+                    otaHasher->update(buff, readBytes);
+                }
+                
+                size_t w = Update.write(buff, readBytes);
+                
+                if (w != (size_t)readBytes) {
+                    otaFailReason = "Flash write failed: size mismatch (" + String(w) + "/" + String(readBytes) + ")";
+                    writeError = true;
+                    break;
+                }
+                
+                otaWritten += readBytes;
+                otaBytesDownloaded = otaWritten;
+                bytesProcessed += readBytes;
+
+                int progress = (otaSize > 0) ? (otaWritten * 100) / otaSize : 0;
+                int progressTen = (progress / 10) * 10;
+                if (progressTen > otaLastProgress) {
+                    otaLastProgress = progressTen;
+                    publishOtaStatus("OTA_PROGRESS", otaLastProgress);
+                }
+                
+                available = stream->available();
+            }
+
+            if (writeError) {
                 Update.abort();
                 otaHttp.end();
                 transitionOtaState(OTA_FAILED);
@@ -854,45 +1050,7 @@ void tickOtaStateMachine() {
 
             if (available == 0) {
                 yield();
-                vTaskDelay(pdMS_TO_TICKS(1));
-                return;
-            }
-
-            if (available > 0) {
-                static uint8_t buff[1024];
-                size_t toRead = std::min(available, sizeof(buff));
-                int readBytes = stream->readBytes(buff, toRead);
-                
-                if (readBytes > 0) {
-                    otaLastDataMillis = millis();
-                    
-                    if (otaSha256.length() > 0 && otaHasher) {
-                        otaHasher->update(buff, readBytes);
-                    }
-                    
-                    size_t w = Update.write(buff, readBytes);
-                    
-                    if (w != (size_t)readBytes) {
-                        otaFailReason = "Flash write failed: size mismatch (" + String(w) + "/" + String(readBytes) + ")";
-                        Update.abort();
-                        otaHttp.end();
-                        transitionOtaState(OTA_FAILED);
-                        return;
-                    }
-                    
-                    otaWritten += readBytes;
-                    otaBytesDownloaded = otaWritten;
-
-                    int progress = (otaSize > 0) ? (otaWritten * 100) / otaSize : 0;
-                    int progressTen = (progress / 10) * 10;
-                    if (progressTen > otaLastProgress) {
-                        otaLastProgress = progressTen;
-                        publishOtaStatus("OTA_PROGRESS", otaLastProgress);
-                    }
-                }
-            } else {
-                yield();
-                vTaskDelay(1 / portTICK_PERIOD_MS);
+                vTaskDelay(pdMS_TO_TICKS(5));
             }
 
             if (millis() - otaLastHeartbeatTime >= 5000) {
@@ -937,7 +1095,7 @@ void tickOtaStateMachine() {
                 otaHasher = nullptr;
             }
             resetOtaState();
-            delay(2000);
+            vTaskDelay(pdMS_TO_TICKS(2000));
             ESP.restart();
             break;
         }
@@ -1160,13 +1318,13 @@ void handleConfigPayload(byte* payload, unsigned int length) {
         if (xSemaphoreTake(fbSemaphore, portMAX_DELAY) == pdTRUE) {
             if (xSemaphoreTake(cameraMutex, portMAX_DELAY) == pdTRUE) {
                 esp_camera_deinit();
-                delay(1000);
+                vTaskDelay(pdMS_TO_TICKS(1000));
                 if (!initCamera(false)) {
                     // Rollback
                     current_frame_size = old_frame_size;
                     current_jpeg_quality = old_jpeg_quality;
                     esp_camera_deinit();
-                    delay(1000);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                     initCamera(false);
                     xSemaphoreGive(cameraMutex);
                     xSemaphoreGive(fbSemaphore);
@@ -1255,6 +1413,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             portEXIT_CRITICAL(&otaPublishMux);
         }
     } else if (String(topic) == topic_config) {
+        String payloadStr = "";
+        for (unsigned int i = 0; i < length; i++) {
+            payloadStr += (char)payload[i];
+        }
+        if (payloadStr == "restart") {
+            remoteRestartRequested = true;
+            return;
+        } else if (payloadStr == "camera_reinit") {
+            remoteCameraReinitRequested = true;
+            return;
+        }
         handleConfigPayload(payload, length);
     }
 }
@@ -1286,7 +1455,7 @@ void sendTelemetryInternal() {
 #if ARDUINOJSON_VERSION_MAJOR >= 7
     JsonDocument doc;
 #else
-    StaticJsonDocument<1024> doc;
+    StaticJsonDocument<3072> doc;
 #endif
     doc["device_id"] = device_id;
     doc["fw_version"] = FW_VERSION;
@@ -1295,7 +1464,6 @@ void sendTelemetryInternal() {
     doc["fw_build"] = FW_BUILD;
     doc["ota_supported"] = true;
     doc["ota_running"] = otaRunning;
-    doc["free_ota_space"] = ESP.getFreeSketchSpace();
     doc["ssid"] = WiFi.SSID();
     doc["bssid"] = WiFi.BSSIDstr();
     doc["channel"] = WiFi.channel();
@@ -1308,19 +1476,6 @@ void sendTelemetryInternal() {
     doc["free_heap"] = ESP.getFreeHeap();
     doc["min_free_heap"] = ESP.getMinFreeHeap();
     doc["fb_null"] = fbNullCount;
-    if (psramFound()) {
-        doc["free_psram"] = ESP.getFreePsram();
-    }
-    uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    doc["largest_free_block"] = largestBlock;
-
-    uint32_t freeHeap = ESP.getFreeHeap();
-    uint32_t fragmentationPct = 0;
-    if (freeHeap > 0 && largestBlock <= freeHeap)
-    {
-        fragmentationPct = 100 - ((largestBlock * 100) / freeHeap);
-    }
-    doc["fragmentation_pct"] = fragmentationPct;
     doc["rssi"] = WiFi.RSSI();
     doc["wifi_status"] = WiFi.status();
 
@@ -1331,43 +1486,27 @@ void sendTelemetryInternal() {
     doc["ws_close_count"] = wsCloseCount;
     doc["mqtt_state"] = mqttState;
     doc["mqtt_uptime_sec"] = mqttIsConnected ? (millis() - lastMqttConnectMillis) / 1000 : 0;
+    doc["transport_state"] = transport_state;
+    doc["last_publish_success_age_ms"] = (lastPublishSuccessMillis == 0) ? -1 : (int32_t)(millis() - lastPublishSuccessMillis);
+    doc["consecutive_transport_recovery"] = consecutive_transport_recovery;
+    doc["last_publish_result"] = last_publish_result;
+    doc["last_connect_result"] = last_connect_result;
+    doc["last_failed_publish_mqtt_state"] = lastFailedPublishMqttState;
+    doc["last_failed_publish_wifi_status"] = (int)lastFailedPublishWifiStatus;
     doc["loop_counter"] = loopCounter;
 
     doc["capture_ok"] = captureOkCount;
     doc["capture_fail"] = captureFailCount;
 
-    doc["publish_ms"] = publishMs;
-    doc["max_publish_ms"] = maxPublishMs;
-    doc["frame_size"] = frameSize;
-    doc["base64_size"] = base64Size;
-    doc["max_base64_size"] = maxBase64Size;
-    doc["mqtt_buffer"] = mqttBufferSize;
-    doc["max_frame_size"] = maxFrameSize;
-
     doc["publish_ok"] = publishOkCount;
     doc["publish_fail"] = publishFailCount;
     doc["telemetry_publish_fail"] = telemetryPublishFailCount;
-    doc["publish_stall"] = publishStallCount;
-    doc["publish_over_interval"] = publishOverIntervalCount;
-    doc["transport_recovery"] = transportRecoveryCount;
-    if (lastPublishAttemptMillis == 0) {
-        doc["last_publish_attempt_sec"] = -1;
-    } else {
-        doc["last_publish_attempt_sec"] = (millis() - lastPublishAttemptMillis) / 1000;
-    }
 
-    doc["camera_reset"] = cameraResetCount;
-    doc["capture_ms"] = lastCaptureMs;
-    doc["max_capture_ms"] = maxCaptureMs;
     doc["wifi_drop"] = wifiDropCount;
     doc["mqtt_reconnect"] = mqttReconnectCount;
     doc["recovery_reason"] = lastRecoveryReason;
     doc["disconnect_reason"] = lastDisconnectReason;
-    if (lastImageSuccessMillis == 0) {
-        doc["last_image_sec"] = -1;
-    } else {
-        doc["last_image_sec"] = (millis() - lastImageSuccessMillis) / 1000;
-    }
+    doc["last_image_sec"] = (lastCaptureSuccessMillis == 0) ? -1 : (int32_t)((millis() - lastCaptureSuccessMillis) / 1000);
 
     doc["reset_reason"] = getResetReason();
 
@@ -1379,27 +1518,82 @@ void sendTelemetryInternal() {
         recovery_state = "NORMAL";
     }
 
-    doc["capture_ms"] = lastCaptureMs;
-    doc["encode_ms"] = lastEncodeMs;
-    doc["publish_ms"] = publishMs;
-    doc["mqtt_connect_ms"] = mqtt_connect_ms;
-    doc["wifi_connect_ms"] = wifi_connect_ms;
-    doc["camera_init_ms"] = camera_init_ms;
-    doc["largest_block"] = largestBlock;
-    doc["free_heap"] = freeHeap;
-    doc["minimum_heap"] = ESP.getMinFreeHeap();
-    doc["transport_slow"] = transport_slow;
-    doc["average_jpeg_size"] = average_jpeg_size;
-    doc["maximum_jpeg_size"] = maximum_jpeg_size;
-
     doc["consecutive_failures"] = consecutive_failures;
     doc["recovery_level"] = consecutive_failures;
     doc["recovery_state"] = recovery_state;
-    doc["suspend_remaining_sec"] = (suspend_capture_until > millis()) ? (suspend_capture_until - millis()) / 1000 : 0;
-    doc["camera_consecutive_fails"] = camera_consecutive_fails;
-    doc["connect_dns_ms"] = connect_dns_ms;
-    doc["connect_ws_ms"] = connect_ws_ms;
-    doc["connect_mqtt_ms"] = connect_mqtt_ms;
+
+    bool sendDiagnostics = (consecutive_failures > 0 || 
+                            lastRecoveryReason != "NONE" || 
+                            strcmp(lastDisconnectReason, "NONE") != 0 ||
+                            transportRecoveryCount > 0 || 
+                            wifiDropCount > 0 || 
+                            publishQueueOverflowCount > 0 || 
+                            publishQueueDropCount > 0);
+
+    if (sendDiagnostics) {
+        if (psramFound()) {
+            doc["free_psram"] = ESP.getFreePsram();
+        }
+        uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        doc["largest_free_block"] = largestBlock;
+
+        uint32_t freeHeap = ESP.getFreeHeap();
+        uint32_t fragmentationPct = 0;
+        if (freeHeap > 0 && largestBlock <= freeHeap) {
+            fragmentationPct = 100 - ((largestBlock * 100) / freeHeap);
+        }
+        doc["fragmentation_pct"] = fragmentationPct;
+
+        doc["publish_ms"] = publishMs;
+        doc["max_publish_ms"] = maxPublishMs;
+        doc["frame_size"] = frameSize;
+        doc["base64_size"] = base64Size;
+        doc["max_base64_size"] = maxBase64Size;
+        doc["mqtt_buffer"] = mqttBufferSize;
+        doc["max_frame_size"] = maxFrameSize;
+
+        doc["publish_stall"] = publishStallCount;
+        doc["publish_over_interval"] = publishOverIntervalCount;
+        doc["transport_recovery"] = transportRecoveryCount;
+        if (lastPublishAttemptMillis == 0) {
+            doc["last_publish_attempt_sec"] = -1;
+        } else {
+            doc["last_publish_attempt_sec"] = (millis() - lastPublishAttemptMillis) / 1000;
+        }
+
+        doc["camera_reset"] = cameraResetCount;
+        doc["capture_ms"] = lastCaptureMs;
+        doc["max_capture_ms"] = maxCaptureMs;
+        doc["encode_ms"] = lastEncodeMs;
+        doc["mqtt_connect_ms"] = mqtt_connect_ms;
+        doc["wifi_connect_ms"] = wifi_connect_ms;
+        doc["camera_init_ms"] = camera_init_ms;
+        doc["transport_slow"] = transport_slow;
+        doc["average_jpeg_size"] = average_jpeg_size;
+        doc["maximum_jpeg_size"] = maximum_jpeg_size;
+
+        doc["suspend_remaining_sec"] = (suspend_capture_until > millis()) ? (suspend_capture_until - millis()) / 1000 : 0;
+        doc["camera_consecutive_fails"] = camera_consecutive_fails;
+        doc["connect_dns_ms"] = connect_dns_ms;
+        doc["connect_ws_ms"] = connect_ws_ms;
+        doc["connect_mqtt_ms"] = connect_mqtt_ms;
+
+        doc["watchdog_trigger_count"] = watchdog_trigger_count;
+        doc["watchdog_last_reason"] = (const char*)watchdog_last_reason;
+        doc["last_watchdog_trigger_ms"] = last_watchdog_trigger_ms;
+        doc["last_transport_recovery_ms"] = last_transport_recovery_ms;
+        doc["transport_recovery_level"] = transport_recovery_level;
+
+        doc["queue_depth"] = (publishQueueTail - publishQueueHead + MAX_PUBLISH_REQUESTS) % MAX_PUBLISH_REQUESTS;
+        doc["queue_peak"] = publishQueuePeak;
+        doc["queue_drop"] = publishQueueDropCount;
+        doc["queue_enqueue_fail"] = publishQueueOverflowCount;
+    }
+
+    size_t len = measureJson(doc);
+    if (len >= sizeof(telemetry_publish_buffer)) {
+        publishQueueOverflowCount++;
+    }
 
     portENTER_CRITICAL(&telemetryPublishMux);
     serializeJson(doc, telemetry_publish_buffer, sizeof(telemetry_publish_buffer));
@@ -1485,7 +1679,7 @@ void handleButton() {
         if (held >= 10000) {
             buttonPressStart = 0;
             ESP.restart();
-        } else if (held >= 5000) {
+        } else if (held >= 7000) {
             WiFiManager wm;
             wm.resetSettings();
             buttonPressStart = 0;
@@ -1500,6 +1694,7 @@ void handleButton() {
 }
 
 void connectToMqtt() {
+    if (otaRunning) return; // Edit 1 & 4: Prevent any new connection attempts during OTA
 
     yield();
     vTaskDelay(1);
@@ -1593,6 +1788,8 @@ void connectToMqtt() {
                 mqttClient.disconnect();
                 mqttIsConnected = false;
                 mqttState = mqttClient.state();
+                last_connect_result = false;
+                updateTransportState(STATE_CONNECT_FAILED, REC_NONE, RecoveryReason::NONE);
                 return;
             }
 
@@ -1602,21 +1799,26 @@ void connectToMqtt() {
             }
             firstMqttConnect = false;
             lastMqttConnectMillis = millis();
-            strncpy(lastDisconnectReason, "NONE", sizeof(lastDisconnectReason));
             mqttIsConnected = true;
             mqttState = mqttClient.state();
+            last_connect_result = true;
+            updateTransportState(STATE_CONNECTED, REC_NONE, RecoveryReason::NONE);
 
             enqueuePublish(topic_status.c_str(), "online", true);
             sendTelemetry();
+            strncpy(lastDisconnectReason, "NONE", sizeof(lastDisconnectReason));
             return;
         }
     }
     mqtt_connect_ms = millis() - start;
     mqttIsConnected = false;
     mqttState = mqttClient.state();
+    last_connect_result = false;
+    updateTransportState(STATE_CONNECT_FAILED, REC_NONE, RecoveryReason::NONE);
 }
 
 void autoRecoverCamera() {
+    if (otaRunning) return; // Edit 1: Suspend camera recovery during OTA
     static uint32_t baselineFbNull = 0;
     if (fbNullCount > baselineFbNull && millis() - lastCameraRecovery > 60000) {
         if (xSemaphoreTake(fbSemaphore, portMAX_DELAY) == pdTRUE) {
@@ -1636,8 +1838,8 @@ void autoRecoverCamera() {
         }
     } else {
         bool recoverMqtt = false;
-        if (lastImageSuccessMillis > 0 &&
-            millis() - lastImageSuccessMillis > 90000 &&
+        if (lastPublishSuccessMillis > 0 &&
+            millis() - lastPublishSuccessMillis > 90000 &&
             mqttIsConnected &&
             realWsConnected &&
             (lastTransportRecoveryMillis == 0 || millis() - lastTransportRecoveryMillis > 180000)) {
@@ -1671,12 +1873,18 @@ void autoRecoverCamera() {
 }
 
 void deadmanRestart(const char* reason) {
+    updateTransportState(STATE_DISCONNECTED, REC_REBOOT, RecoveryReason::DEADMAN_TIMEOUT);
     requestRecovery(reason);
 }
 
 void setup() {
     cameraMutex = xSemaphoreCreateMutex();
     fbSemaphore = xSemaphoreCreateMutex();
+    // Edit 2 & 3: Initialize FreeRTOS Event Group for task synchronization
+    otaSyncEventGroup = xEventGroupCreate();
+    if (otaSyncEventGroup != nullptr) {
+        xEventGroupSetBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT | PUBLISHER_IDLE_BIT);
+    }
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = HW_WDT_SEC * 1000,
@@ -1747,6 +1955,18 @@ void loop() {
     loopCounter++;
     handleButton();
 
+    if (remoteCameraReinitRequested) {
+        remoteCameraReinitRequested = false;
+        resetCameraOnly();
+        lastRecoveryReason = "REMOTE_CAMERA_REINIT";
+    }
+
+    if (remoteRestartRequested) {
+        remoteRestartRequested = false;
+        lastRecoveryReason = "REMOTE_RESTART";
+        ESP.restart();
+    }
+
     // Check for deferred recovery requests
     if (recoveryRequestReason != nullptr) {
         const char* reason = (const char*)recoveryRequestReason;
@@ -1784,8 +2004,14 @@ void loop() {
 
     autoRecoverCamera();
 
-    if (lastImageSuccessMillis > 0 &&
-        millis() - lastImageSuccessMillis > DEADMAN_TIMEOUT_MS) {
+    if (publisherStarted && millis() - publisherProgressMillis > 30000) {
+        lastRecoveryReason = "PUBLISHER_STUCK";
+        updateTransportState(STATE_DISCONNECTED, REC_REBOOT, RecoveryReason::PUBLISHER_STUCK);
+        ESP.restart();
+    }
+
+    if (lastPublishSuccessMillis > 0 &&
+        millis() - lastPublishSuccessMillis > DEADMAN_TIMEOUT_MS) {
         deadmanRestart("NO_IMAGE_SUCCESS");
     }
 
@@ -1794,12 +2020,47 @@ void loop() {
             otaRequested = false;
             publishOtaStatus("OTA_FAILED", -1, "OTA request expired");
         } else {
-            startOta();
+            // Edit 2 & 3: Stop CameraCaptureTask and wait for both camera and publisher image pipelines to become completely idle
+            otaRunning = true; // Signal tasks to stop capturing / queueing new frames
+            
+            bool idle = false;
+            if (otaSyncEventGroup) {
+                // RTOS-native non-busy wait for both capture task and publisher task to yield and report idle state
+                EventBits_t bits = xEventGroupWaitBits(
+                    otaSyncEventGroup,
+                    CAMERA_CAPTURE_IDLE_BIT | PUBLISHER_IDLE_BIT,
+                    pdFALSE,             // Do not clear bits on exit
+                    pdTRUE,              // Wait for both tasks to report idle
+                    pdMS_TO_TICKS(10000) // Timeout 10 seconds
+                );
+                
+                // Confirm both tasks are idle and the pending frame buffer is empty
+                if ((bits & (CAMERA_CAPTURE_IDLE_BIT | PUBLISHER_IDLE_BIT)) == (CAMERA_CAPTURE_IDLE_BIT | PUBLISHER_IDLE_BIT) &&
+                    pendingFrame.state == PendingFrameState::EMPTY) {
+                    idle = true;
+                }
+            } else {
+                // Fallback in case Event Group creation failed
+                idle = (pendingFrame.state == PendingFrameState::EMPTY);
+            }
+            
+            if (idle) {
+                startOta();
+            } else {
+                otaRunning = false;
+                otaRequested = false;
+                publishOtaStatus("OTA_FAILED", -1, "Pipeline idle handshake timeout");
+            }
         }
     }
 
     if (otaRunning) {
-        tickOtaStateMachine();
+        if (WiFi.status() != WL_CONNECTED) {
+            // Edit 1: If WiFi is disconnected during OTA, fail/abort the update immediately to resume normal operation
+            cleanupAndFail(otaHttp, "WiFi connection lost during OTA");
+        } else {
+            tickOtaStateMachine();
+        }
     }
 
     if (!otaRunning && telemetry_enabled && (millis() - last_telemetry_time >= telemetry_interval_ms)) {
@@ -1814,24 +2075,27 @@ void loop() {
         if (prevWifi == WL_CONNECTED) {
             wifiDropCount++;
             wifiDisconnectTime = millis();
-        } else {
+        } else if (!otaRunning) { // Edit 1: Suspend WiFi recovery reconnection attempts during OTA
             unsigned long offlineTime = millis() - wifiDisconnectTime;
-            if (offlineTime > 600000) {
-                WiFi.disconnect(true);
-                delay(1000);
-                WiFi.begin();
-                wifiDisconnectTime = millis();
-            } else if (offlineTime > 300000) {
-                static unsigned long lastReconnectAttempt = 0;
-                if (millis() - lastReconnectAttempt > 60000) {
-                    unsigned long start = millis();
-                    WiFi.reconnect();
-                    wifi_connect_ms = millis() - start;
-                    lastReconnectAttempt = millis();
-                }
-            }
+              if (offlineTime > 600000) {
+                  updateTransportState(STATE_RECOVERING, REC_WIFI_BEGIN, RecoveryReason::WIFI_OFFLINE_600S);
+                  WiFi.disconnect(true);
+                  vTaskDelay(pdMS_TO_TICKS(1000));
+                  WiFi.begin();
+                  wifiDisconnectTime = millis();
+              } else if (offlineTime > 300000) {
+                  static unsigned long lastReconnectAttempt = 0;
+                  if (millis() - lastReconnectAttempt > 60000) {
+                      updateTransportState(STATE_RECOVERING, REC_WIFI_RECONNECT, RecoveryReason::WIFI_OFFLINE_300S);
+                      WiFi.reconnect();
+                      lastReconnectAttempt = millis();
+                  }
+              }
         }
     } else {
+        if (prevWifi != WL_CONNECTED && wifiDisconnectTime > 0) {
+            wifi_connect_ms = millis() - wifiDisconnectTime;
+        }
         wifiDisconnectTime = 0;
     }
 
@@ -1876,6 +2140,11 @@ void sendPhoto() {
         return;
     }
     
+    // Edit 2: Mark camera capture task active in Event Group
+    if (otaSyncEventGroup) {
+        xEventGroupClearBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT);
+    }
+
     bool isFree = false;
     portENTER_CRITICAL(&pendingFrameMux);
     if (pendingFrame.state == PendingFrameState::EMPTY) {
@@ -1883,6 +2152,9 @@ void sendPhoto() {
     }
     portEXIT_CRITICAL(&pendingFrameMux);
     if (!isFree) {
+        if (otaSyncEventGroup) {
+            xEventGroupSetBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT);
+        }
         return;
     }
 
@@ -1922,14 +2194,21 @@ void sendPhoto() {
                 }
             }
             xSemaphoreGive(fbSemaphore);
+            if (otaSyncEventGroup) {
+                xEventGroupSetBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT);
+            }
             return;
         }
     } else {
+        if (otaSyncEventGroup) {
+            xEventGroupSetBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT);
+        }
         return;
     }
     camera_consecutive_fails = 0; 
 
     captureOkCount++;
+    lastCaptureSuccessMillis = millis();
     frameSize = fb->len;
     if (frameSize > maxFrameSize) {
         maxFrameSize = frameSize;
@@ -1958,6 +2237,9 @@ void sendPhoto() {
     xSemaphoreGive(fbSemaphore);
 
     if (!encodeSuccess) {
+        if (otaSyncEventGroup) {
+            xEventGroupSetBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT);
+        }
         return;
     }
 
@@ -1971,6 +2253,9 @@ void sendPhoto() {
     if (dataSize >= mqttLimit) {
         publishFailCount++;
         requestRecovery("PAYLOAD_TOO_LARGE");
+        if (otaSyncEventGroup) {
+            xEventGroupSetBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT);
+        }
         return;
     }
 
@@ -1982,6 +2267,9 @@ void sendPhoto() {
     pendingFrame.topic = topic_image.c_str();
     pendingFrame.state = PendingFrameState::READY;
     portEXIT_CRITICAL(&pendingFrameMux);
+    if (otaSyncEventGroup) {
+        xEventGroupSetBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT);
+    }
 }
 
 void CameraCaptureTask(void* pvParameters) {
@@ -1993,6 +2281,9 @@ void CameraCaptureTask(void* pvParameters) {
             portENTER_CRITICAL(&pendingFrameMux);
             pendingFrame.state = PendingFrameState::EMPTY;
             portEXIT_CRITICAL(&pendingFrameMux);
+            if (otaSyncEventGroup) {
+                xEventGroupSetBits(otaSyncEventGroup, CAMERA_CAPTURE_IDLE_BIT);
+            }
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
@@ -2042,15 +2333,46 @@ void ImagePublisherTask(void* pvParameters) {
     static unsigned long mqttRetryDelayMs = 1000;
 
     while (true) {
+        publisherStarted = true;
+        publisherProgressMillis = millis();
         esp_task_wdt_reset();
 
         if (otaRunning) {
             portENTER_CRITICAL(&pendingFrameMux);
             pendingFrame.state = PendingFrameState::EMPTY;
             portEXIT_CRITICAL(&pendingFrameMux);
+            if (otaSyncEventGroup) {
+                xEventGroupSetBits(otaSyncEventGroup, PUBLISHER_IDLE_BIT);
+            }
         }
 
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+
+        // 8. Never trust only mqttClient.connected(). Health must require BOTH mqttClient.connected() AND recent successful publish within timeout.
+        if (mqttClient.connected() && !otaRunning) {
+            updateTransportState(STATE_CONNECTED, REC_NONE, RecoveryReason::NONE);
+            
+            // Skip watchdog check if we connected very recently (grace period)
+            if (millis() - lastMqttConnectMillis >= 30000UL) {
+                bool watchdogTriggered = false;
+                const char* triggerReason = "NONE";
+                if (consecutivePublishFail >= 10) {
+                    watchdogTriggered = true;
+                    triggerReason = "CONSECUTIVE_FAILURES";
+                } else if (image_enabled && (millis() >= suspend_capture_until) && (lastPublishSuccessMillis > 0) && (millis() - lastPublishSuccessMillis > TRANSPORT_WATCHDOG_TIMEOUT_MS)) {
+                    watchdogTriggered = true;
+                    triggerReason = "TIMEOUT";
+                }
+
+                if (watchdogTriggered && (millis() - lastWatchdogRecoveryMillis > 60000)) {
+                    mqttDisconnectRequested = true;
+                    lastWatchdogRecoveryMillis = millis();
+                    RecoveryReason recReason = (strcmp(triggerReason, "TIMEOUT") == 0) ? RecoveryReason::WATCHDOG_TIMEOUT : RecoveryReason::CONSECUTIVE_FAILURES;
+                    updateTransportState(STATE_RECOVERING, REC_TRANSPORT_RECONNECT, recReason);
+                    strncpy(lastDisconnectReason, "WATCHDOG_RECOVERY", sizeof(lastDisconnectReason));
+                }
+            }
+        }
 
         if (mqttDisconnectRequested) {
             mqttDisconnectRequested = false;
@@ -2060,12 +2382,38 @@ void ImagePublisherTask(void* pvParameters) {
             mqttIsConnected = false;
             mqttState = mqttClient.state();
             mqttRetryDelayMs = 1000;
+            consecutive_transport_recovery++;
+
+            // Requirement 4: If transport recovery repeats 5 consecutive times without successful publish, WiFi reconnect
+            if (consecutive_transport_recovery >= 5) {
+                consecutive_transport_recovery = 0;
+                updateTransportState(STATE_RECOVERING, REC_WIFI_RECONNECT, RecoveryReason::CONSECUTIVE_TRANSPORT_FAILURES);
+                WiFi.disconnect(false);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                WiFi.reconnect();
+            } else {
+                updateTransportState(STATE_RECOVERING, REC_TRANSPORT_RECONNECT, RecoveryReason::NONE);
+            }
         }
 
         if (!mqttClient.connected()) {
             mqttIsConnected = false;
             mqttState = mqttClient.state();
+            if (strcmp(transport_state, STATE_RECOVERING) != 0 && strcmp(transport_state, STATE_CONNECT_FAILED) != 0) {
+                updateTransportState(STATE_DISCONNECTED, REC_NONE, RecoveryReason::NONE);
+            }
+            if (otaRunning) {
+                // Edit 1 & 4: Suspend MQTT reconnect attempts during OTA
+                if (otaSyncEventGroup) {
+                    xEventGroupSetBits(otaSyncEventGroup, PUBLISHER_IDLE_BIT);
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
             if (WiFi.status() == WL_CONNECTED) {
+                if (transport_recovery_level < 2) {
+                    updateTransportState(STATE_RECOVERING, REC_MQTT_RECONNECT, RecoveryReason::MQTT_CONNECTING);
+                }
                 int32_t jitter = (int32_t)(esp_random() % 501) - 250;
                 long currentDelay = (long)mqttRetryDelayMs + jitter;
                 if (currentDelay < 0) currentDelay = 0;
@@ -2119,6 +2467,10 @@ void ImagePublisherTask(void* pvParameters) {
             portEXIT_CRITICAL(&pendingFrameMux);
 
             if (imageReady) {
+                // Edit 3: Mark publisher active in Event Group
+                if (otaSyncEventGroup) {
+                    xEventGroupClearBits(otaSyncEventGroup, PUBLISHER_IDLE_BIT);
+                }
                 unsigned long pubStart = millis();
                 lastPublishAttemptMillis = millis();
                 
@@ -2153,12 +2505,16 @@ void ImagePublisherTask(void* pvParameters) {
 
                 TransportHealth health = evaluateTransportHealth(success, publishMsVal);
 
+                last_publish_result = success;
                 if (success) {
                     publishOkCount++;
                     consecutive_failures = 0; 
-                    lastImageSuccessMillis = millis();
+                    lastPublishSuccessMillis = millis();
+                    updateTransportState(STATE_CONNECTED, REC_NONE, RecoveryReason::NONE);
                 } else {
                     publishFailCount++;
+                    lastFailedPublishMqttState = mqttClient.state();
+                    lastFailedPublishWifiStatus = (wl_status_t)WiFi.status();
                 }
 
                 portENTER_CRITICAL(&pendingFrameMux);
@@ -2168,10 +2524,15 @@ void ImagePublisherTask(void* pvParameters) {
                 mqttClient.loop();
                 wsClient.poll();
 
-                if (health == RECOVERY_REQUIRED) {
-                    if (consecutivePublishFail >= 3) {
-                        requestRecovery("PUBLISH_FAILED");
-                    }
+                // 7. Let watchdog decide on recovery. Do not immediately reconnect.
+                // if (health == RECOVERY_REQUIRED) {
+                //     if (consecutivePublishFail >= 3) {
+                //         requestRecovery("PUBLISH_FAILED");
+                //     }
+                // }
+                // Edit 3: Mark publisher idle in Event Group
+                if (otaSyncEventGroup) {
+                    xEventGroupSetBits(otaSyncEventGroup, PUBLISHER_IDLE_BIT);
                 }
             }
         } else if (!mqttClient.connected()) {
@@ -2190,7 +2551,13 @@ void ImagePublisherTask(void* pvParameters) {
 
             bool success = mqttClient.publish(req.topic, req.payload, req.retained);
             publishedCount++;
-            if (!success) {
+            
+            last_publish_result = success;
+            if (success) {
+                updateTransportState(STATE_CONNECTED, REC_NONE, RecoveryReason::NONE);
+            } else {
+                lastFailedPublishMqttState = mqttClient.state();
+                lastFailedPublishWifiStatus = (wl_status_t)WiFi.status();
                 if (strcmp(req.topic, topic_telemetry.c_str()) == 0) {
                     telemetryPublishFailCount++;
                 }
